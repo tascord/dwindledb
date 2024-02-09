@@ -1,0 +1,33 @@
+
+running 1 test
+test test::test_pager ... FAILED
+
+failures:
+
+---- test::test_pager stdout ----
+Allocating new page 1
+Allocating new page 2
+Wrote 29b to page 2 (8192)
+New spans: [Allocated { page: 2, size: 29 }]
+Read spans: [Allocated { page: 2, size: 29 }]
+Read 29b from page 2 (8192)
+[+] Wrote first doc!
+Allocating new page 3
+Allocating new page 4
+Wrote 4096b to page 4 (16384)
+Allocating new page 5
+Wrote 3820b to page 5 (20480)
+New spans: [Allocated { page: 4, size: 4096 }, Allocated { page: 5, size: 3820 }]
+Read spans: [Allocated { page: 4, size: 4096 }, Allocated { page: 5, size: 3820 }]
+Read 4096b from page 4 (16384)
+Read 3820b from page 5 (20480)
+thread 'test::test_pager' panicked at src/pager/mod.rs:223:18:
+called `Result::unwrap()` on an `Err` value: UnexpectedEnd { additional: 64 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test::test_pager
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
