@@ -1,13 +1,16 @@
-use std::{any::Any, collections::{BTreeMap, HashMap}};
+use std::collections::{BTreeMap, HashMap};
 
 use bincode::{config, Decode, Encode};
 
+pub trait Datable: Encode + Decode + Clone {}
+impl<T> Datable for T where T: Encode + Decode + Clone {}
+
 pub struct Data<T>(pub T)
 where
-    T: Encode + Decode;
+    T: Datable;
 impl<T> Data<T>
 where
-    T: Encode + Decode,
+    T: Datable,
 {
     pub fn dec(s: &[u8]) -> Result<Self, String> {
         Ok(Self(
@@ -17,9 +20,8 @@ where
         ))
     }
 
-    pub fn enc(&self) -> Result<&[u8], String> {
-        bincode::encode_to_vec(self.0, config::standard())
-            .map(|a| a.as_slice())
+    pub fn enc(&self) -> Result<Vec<u8>, String> {
+        bincode::encode_to_vec(self.0.clone(), config::standard())
             .map_err(|_| "Unable to encode value".to_string())
     }
 }
@@ -87,15 +89,16 @@ impl Document {
 
     pub fn insert<T>(&mut self, key: &str, value: T) -> Result<(), String>
     where
-        T: Decode + Encode,
+        T: Datable,
     {
-        self.content.insert(key.to_string(), Data(value).enc()?.to_vec());
+        self.content
+            .insert(key.to_string(), Data(value).enc()?.to_vec());
         Ok(())
     }
 
     pub fn get<T>(&self, key: &str) -> Result<Option<Data<T>>, String>
     where
-        T: Decode + Encode,
+        T: Datable,
     {
         match self.content.get(key) {
             None => Ok(None),

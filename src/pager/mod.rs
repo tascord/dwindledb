@@ -1,11 +1,16 @@
 use bincode::{config, Decode, Encode};
-use std::collections::BTreeMap;
+use log::warn;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::sync::Mutex;
 
+// TODO: WRITE INDICIES PAGE
+// AND READ 
+// YAY :D
+
 use crate::pager::document::Span;
-use crate::query::Query;
+use crate::query::{FilterFn, Isolator, Query};
 
 use self::document::{Data, Document};
 
@@ -36,7 +41,10 @@ pub struct Pager {
     entry: File,
     free_pages: Mutex<Vec<usize>>,
     last_used_page: Mutex<usize>,
-    indices: Mutex<BTreeMap<String, BTreeMap<String, usize>>>,
+    indices_page: usize,
+
+    /// {[key: string]: {[value: Vec<u8>]: Vec<page: number>}}
+    indices: Mutex<BTreeMap<String, BTreeMap<Vec<u8>, Vec<usize>>>>,
 }
 
 impl Pager {
@@ -50,8 +58,9 @@ impl Pager {
         let mut pager = Pager {
             entry: file_entry?,
             free_pages: Mutex::new(Vec::new()),
-            last_used_page: Mutex::new(1),
+            last_used_page: Mutex::new(0),
             indices: Mutex::new(BTreeMap::new()),
+            indices_page: 0,
         };
 
         pager.initialize_header()?;
@@ -121,16 +130,17 @@ impl Pager {
     fn initialize_indices(&mut self) -> anyhow::Result<()> {
         if self.entry.metadata()?.len() < PAGE_SIZE as u64 * 2 {
             let mut doc = self.doc();
-            assert!(doc.metadata.id == 1);
+            self.indices_page = doc.metadata.id;
             for (key, val) in self.indices.lock().unwrap().clone() {
                 doc.insert(
                     &key,
                     BTreeMap::from_iter(val.into_iter().map(|(k, v)| (k, v))),
-                );
+                )
+                .map_err(|_| anyhow::anyhow!("Unable to insert index"))?;
             }
             self.write_document(doc)?;
         } else {
-            let doc = self.read_document(1)?;
+            let doc = self.read_document(self.indices_page)?;
             let mut lock = self.indices.lock().unwrap();
             for (key, val) in doc.content {
                 lock.insert(
@@ -144,13 +154,14 @@ impl Pager {
     }
 
     fn update_indices(&mut self) -> anyhow::Result<()> {
-        let mut doc = self.read_document(1)?;
+        let mut doc = self.read_document(self.indices_page)?;
         doc.content.clear();
         for (key, val) in self.indices.lock().unwrap().clone() {
             doc.insert(
                 &key,
                 BTreeMap::from_iter(val.into_iter().map(|(k, v)| (k, v))),
-            );
+            )
+            .map_err(|_| anyhow::anyhow!("Unable to update index"))?;
         }
         self.write_document(doc)?;
         Ok(())
@@ -184,54 +195,123 @@ impl Pager {
         free_pages.push(page);
     }
 
+    fn remove_index(&mut self, key: &str, value: Vec<u8>, page: usize) {
+        let mut lock = self.indices.lock().unwrap();
+        match lock.get_mut(key) {
+            Some(bt) => {
+                let vec_at_value = bt.get_mut(&value).unwrap();
+                if vec_at_value.len() == 1 {
+                    bt.remove(&value);
+                } else {
+                    *vec_at_value = vec_at_value
+                        .clone()
+                        .into_iter()
+                        .filter(|&x| x != page)
+                        .collect();
+                }
+            }
+            None => warn!("Tried to remove non-existent index"),
+        }
+    }
+
+    fn insert_index(&mut self, key: &str, value: Vec<u8>, page: usize) {
+        let mut lock = self.indices.lock().unwrap();
+        match lock.get_mut(key) {
+            Some(bt) => match bt.get_mut(&value) {
+                Some(vec_at_value) => {
+                    vec_at_value.push(page);
+                }
+                None => {
+                    bt.insert(value, vec![page]);
+                }
+            },
+            None => {
+                lock.insert(
+                    key.to_string(),
+                    BTreeMap::from_iter(vec![(value, vec![page])]),
+                );
+            }
+        }
+    }
+
+    fn replace_index(&mut self, key: &str, old_value: Vec<u8>, new_value: Vec<u8>, page: usize) {
+        let mut lock = self.indices.lock().unwrap();
+        match lock.get_mut(key) {
+            Some(bt) => {
+                let vec_at_value = bt.get_mut(&old_value).unwrap();
+                if vec_at_value.len() == 1 {
+                    bt.remove(&old_value);
+                } else {
+                    *vec_at_value = vec_at_value
+                        .clone()
+                        .into_iter()
+                        .filter(|&x| x != page)
+                        .collect();
+                }
+
+                match bt.get_mut(&new_value) {
+                    Some(vec_at_value) => {
+                        vec_at_value.push(page);
+                    }
+                    None => {
+                        bt.insert(new_value, vec![page]);
+                    }
+                }
+            }
+            None => warn!("Tried to update non-existent index"),
+        }
+    }
+
     pub fn write_document(&mut self, mut document: Document) -> anyhow::Result<()> {
         // Skip indexing the indices
         if document.id() != 1 {
-            let previous_indices = self
-                .read_document(document.id())
-                .ok()
-                .map(|d| d.content)
-                .unwrap_or_default()
-                .iter();
+            let previous_indices = match self.read_document(document.id()) {
+                Ok(doc) => doc.content,
+                Err(_) => BTreeMap::new(),
+            };
+
             let calculated_indices = document.content.iter();
 
+            // Calculate removed, added, and updated indices
             let removed = previous_indices
-                .filter(|(k, _)| !calculated_indices.any(|(k2, _)| k.to_string() == k2.to_string()))
-                .collect::<Vec<(&String, &Value)>>();
+                .iter()
+                .filter(|(k, _)| !calculated_indices.clone().any(|(key, _)| key == *k))
+                .map(|(k, _)| k.to_string())
+                .collect::<Vec<String>>();
+
             let added = calculated_indices
-                .filter(|(k, _)| !previous_indices.any(|(k2, _)| k.to_string() == k2.to_string()))
-                .collect::<Vec<(&String, &Value)>>();
+                .clone()
+                .filter(|(k, _)| !previous_indices.iter().any(|(key, _)| key == *k))
+                .map(|(k, _)| k.to_string())
+                .collect::<Vec<String>>();
+
             let updated = calculated_indices
+                .clone()
                 .filter(|(k, v)| {
-                    previous_indices.any(|(k2, v2)| k.to_string() == k2.to_string() && **v != *v2)
+                    previous_indices
+                        .iter()
+                        .any(|(key, val)| key == *k && &val != v)
                 })
-                .map(|(k, v)| {
-                    let (pk, pv) = previous_indices
-                        .find(|(k2, _)| k.to_string() == k2.to_string())
-                        .unwrap();
-                    (pk, pv, k, v)
-                })
-                .collect::<Vec<(&String, &Value, &String, &Value)>>();
+                .map(|(k, _)| k.to_string())
+                .collect::<Vec<String>>();
 
-            let lock = self.indices.lock().unwrap();
-            for (index, value) in removed {
-                let l = lock.get(index).unwrap().get(&value.to_string()).unwrap();
+            for key in removed {
+                let value = previous_indices.get(&key).unwrap();
+                self.remove_index(&key, value.clone(), document.id());
             }
 
-            for (index, value) in added {
-                let l = lock.get(index).get(value).insert(document.id);
+            for key in added {
+                let value = document.content.get(&key).unwrap();
+                self.insert_index(&key, value.clone(), document.id());
             }
 
-            for (previous_index, previous_value, index, value) in updated {
-                let l = lock
-                    .get(previous_index)
-                    .get(previous_value)
-                    .remove(document.id);
-                let l = lock.get(index).get(value).insert(document.id);
+            for key in updated {
+                let old_value = previous_indices.get(&key).unwrap();
+                let new_value = document.content.get(&key).unwrap();
+                self.replace_index(&key, old_value.clone(), new_value.clone(), document.id());
             }
 
-            drop(lock);
-            update_indices(self, removed, added, updated);
+            self.update_indices()?;
         }
 
         let spans = document.serialize(PAGE_SIZE);
@@ -309,23 +389,47 @@ impl Pager {
 
         Ok(Document {
             content: bincode::decode_from_slice(&content, config::standard())
-                .unwrap()
+                .map_err(|e| anyhow::anyhow!(e))?
                 .0,
             metadata: meta,
         })
     }
 
     pub fn query(&mut self, query: Query) -> anyhow::Result<Vec<Document>> {
-        // let mut documents = Vec::new();
+        let mut filters = HashMap::<String, FilterFn>::new();
 
-        // for span in &query::execute(&query) {
-        //     let document = self.read_document(span)?;
-        //     documents.push(document);
-        // }
+        // Construct filters from isolators
+        for (key, isolator) in query.0 {
+            match isolator {
+                Isolator::Eq(value) => {
+                    let filter = move |val: &Vec<u8>| {
+                        val == &bincode::encode_to_vec(value.clone(), config::standard()).unwrap()
+                    };
 
-        // Ok(documents)
+                    filters.insert(key, Box::new(filter));
+                }
+            }
+        }
 
-        Ok(vec![])
+        // Iterate over all indexed values
+        let indices = self.indices.lock().unwrap();
+        let mut pages = Vec::<usize>::new();
+        for (key, filter) in filters {
+            if let Some(index) = indices.get(&key) {
+                for (value, page) in index {
+                    if filter(value) {
+                        pages.extend(page);
+                    }
+                }
+            }
+        }
+
+        drop(indices);
+
+        Ok(pages
+            .into_iter()
+            .map(|page| self.read_document(page).unwrap())
+            .collect())
     }
 
     pub fn doc(&mut self) -> Document {
